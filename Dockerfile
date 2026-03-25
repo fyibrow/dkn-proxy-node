@@ -1,29 +1,56 @@
-FROM --platform=$BUILDPLATFORM rust:1.83 AS builder
+# ═══════════════════════════════════════════════════════════════════════════════
+# Stage 1 — Build
+# ═══════════════════════════════════════════════════════════════════════════════
+FROM rust:1.83-slim-bookworm AS builder
 
-# https://docs.docker.com/engine/reference/builder/#automatic-platform-args-in-the-global-scope
-#
-# We use distroless, which allow the following platforms:
-#   linux/amd64
-#   linux/arm64
-#   linux/arm
-#
-# To build an image & push them to Docker hub for this Dockerfile:
-#
-# docker buildx build --platform=linux/amd64,linux/arm64,linux/arm . -t firstbatch/dria-compute-node:latest --builder=dria-builder --push   
-ARG BUILDPLATFORM
-ARG TARGETPLATFORM
-RUN echo "Build platform:  $BUILDPLATFORM"
-RUN echo "Target platform: $TARGETPLATFORM"
+WORKDIR /build
 
-# build release binary
-WORKDIR /usr/src/app
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Cache dependencies layer: copy manifests first, then source
+COPY Cargo.toml Cargo.lock ./
+
+# Pre-fetch dependencies (dummy build to cache layers)
+RUN mkdir -p src && \
+    echo 'fn main(){}' > src/main.rs && \
+    cargo fetch 2>/dev/null || true && \
+    rm -rf src
+
+# Copy full source
 COPY . .
-RUN cargo build --bin dkn-compute --release
 
-# copy release binary to distroless
-FROM --platform=$BUILDPLATFORM gcr.io/distroless/cc
-COPY --from=builder /usr/src/app/target/release/dkn-compute /
+# Build release binary
+RUN cargo build --release 2>&1 && \
+    strip target/release/dria-node
 
-EXPOSE 8080
+# ═══════════════════════════════════════════════════════════════════════════════
+# Stage 2 — Runtime (minimal image)
+# ═══════════════════════════════════════════════════════════════════════════════
+FROM debian:bookworm-slim AS runtime
 
-CMD ["./dkn-compute"]
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy binary from builder
+COPY --from=builder /build/target/release/dria-node /usr/local/bin/dria-node
+
+# Non-root user
+RUN useradd -r -s /bin/false -m -d /home/dria dria
+USER dria
+
+# dria-node writes nothing to disk (no model downloads)
+WORKDIR /home/dria
+
+ENTRYPOINT ["dria-node"]
+CMD ["start"]
+
+# Labels
+LABEL org.opencontainers.image.title="dria-proxy-node"
+LABEL org.opencontainers.image.description="Dria Compute Node — Cloud API Proxy Edition"
+LABEL org.opencontainers.image.source="https://github.com/fyibrow/dkn-proxy-node"

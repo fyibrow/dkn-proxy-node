@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 mod config;
 mod error;
 mod identity;
@@ -14,23 +16,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use llama_cpp_2::context::params::KvCacheType;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
 use config::{Cli, Command, Config};
 use identity::Identity;
-use models::{ModelCache, ModelDownloader, default_registry, resolve_model};
 use models::registry::ModelSpec;
-use network::{NodeMessage, RouterMessage};
+use models::default_registry;
 use network::protocol::ModelType;
-use network::RouterConnection;
+use network::{NodeMessage, RouterMessage, RouterConnection};
 use stats::NodeStats;
 use worker::{CompletedTask, Worker};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing
+    // Load .env file if present (silently ignore if missing)
+    let _ = dotenvy::dotenv();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -40,42 +42,49 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Setup {
-            data_dir,
-            gpu_layers,
-        } => {
-            setup::run_setup(data_dir, gpu_layers).await?;
+        Command::Setup => {
+            setup::run_setup().await?;
         }
         Command::Start {
             wallet,
             model,
             router_url,
-            gpu_layers,
             max_concurrent,
-            data_dir,
-            quant,
+            proxy_api_url,
+            proxy_api_key,
+            proxy_default_model,
+            proxy_models,
             insecure,
             skip_update,
-            context_size,
-            kv_quant,
         } => {
-            run_start(wallet, model, router_url, gpu_layers, max_concurrent, data_dir, quant, insecure, skip_update, context_size, kv_quant).await?;
+            run_start(
+                wallet,
+                model,
+                router_url,
+                max_concurrent,
+                proxy_api_url,
+                proxy_api_key,
+                proxy_default_model,
+                proxy_models,
+                insecure,
+                skip_update,
+            )
+            .await?;
         }
     }
 
     Ok(())
 }
 
-/// Shared state needed by event handlers for reconnection and challenge-response.
+/// Shared state needed by event handlers.
 struct NodeContext {
     identity: Identity,
     config: Config,
     tps: HashMap<String, f64>,
     stats: Arc<NodeStats>,
-    cache: ModelCache,
 }
 
-/// Result of a background model download + load operation.
+/// Result of a background model engine creation.
 struct ModelLoadResult {
     name: String,
     model_type: ModelType,
@@ -87,23 +96,30 @@ async fn run_start(
     wallet: String,
     model: String,
     router_url: String,
-    gpu_layers: i32,
     max_concurrent: usize,
-    data_dir: Option<std::path::PathBuf>,
-    quant: Option<String>,
+    proxy_api_url: String,
+    proxy_api_key: String,
+    proxy_default_model: String,
+    proxy_models: String,
     insecure: bool,
     skip_update: bool,
-    max_context: Option<u32>,
-    kv_quant: String,
 ) -> anyhow::Result<()> {
-    // Parse config
-    let config = Config::from_start_args(wallet, model, router_url, gpu_layers, max_concurrent, data_dir, quant, insecure, skip_update, max_context, kv_quant)?;
+    let config = Config::from_start_args(
+        wallet,
+        model,
+        router_url,
+        max_concurrent,
+        proxy_api_url,
+        proxy_api_key,
+        proxy_default_model,
+        proxy_models,
+        insecure,
+        skip_update,
+    )?;
 
-    // Create identity
     let identity = Identity::from_secret_hex(&config.secret_key_hex)?;
     tracing::info!(address = %format!("0x{}", identity.address_hex), "node identity");
 
-    // Check for updates
     if !config.skip_update {
         match update::check_for_update().await {
             Ok(update::UpdateAction::Force(version)) => {
@@ -118,40 +134,39 @@ async fn run_start(
             Ok(update::UpdateAction::Warn(version)) => {
                 tracing::warn!(
                     %version,
-                    "new patch version available, update recommended (current: {})",
+                    "new patch version available (current: {})",
                     env!("CARGO_PKG_VERSION")
                 );
             }
             Ok(update::UpdateAction::UpToDate) => {}
-            Err(e) => {
-                tracing::debug!(%e, "update check failed, continuing");
-            }
+            Err(e) => tracing::debug!(%e, "update check failed"),
         }
     }
 
-    // Ensure directories exist
     std::fs::create_dir_all(&config.data_dir)?;
-    std::fs::create_dir_all(&config.models_dir)?;
 
-    // Parse KV cache quantization type
-    let kv_cache_type = parse_kv_quant(&config.kv_quant)?;
-
-    // Resolve and download models
     let registry = default_registry();
-    let cache = ModelCache::new(config.models_dir.clone())?;
 
-    // Accumulate engines and TPS per model
+    // Create cloud inference engines for each advertised model
     let mut engines: HashMap<String, (inference::InferenceEngine, ModelType)> = HashMap::new();
     let mut tps_map: HashMap<String, f64> = HashMap::new();
 
     for model_name in &config.model_names {
-        let spec = resolve_model(model_name, &registry, config.quant.as_deref())
-            .ok_or_else(|| error::NodeError::Model(format!("unknown model: {model_name}")))?;
+        let model_type = registry
+            .get(model_name.as_str())
+            .map(|s| s.model_type)
+            .unwrap_or(ModelType::Text);
 
-        let (engine, tps) = download_and_load_model(&spec, &cache, config.gpu_layers, config.max_context, Some(kv_cache_type)).await?;
+        let (engine, tps) =
+            create_cloud_engine(model_name, model_type, &config).await?;
 
-        tracing::info!(tps = %format!("{tps:.1}"), model = %model_name, "benchmark complete");
-        engines.insert(model_name.clone(), (engine, spec.model_type));
+        tracing::info!(
+            model = %model_name,
+            cloud_model = %config.resolve_cloud_model(model_name),
+            tps = %format!("{tps:.1}"),
+            "engine ready"
+        );
+        engines.insert(model_name.clone(), (engine, model_type));
         tps_map.insert(model_name.clone(), tps);
     }
 
@@ -159,13 +174,11 @@ async fn run_start(
         return Err(error::NodeError::Config("no models loaded".into()).into());
     }
 
-    // Print banner
     eprint!("{}", include_str!("../dnet.art"));
 
-    // Build the worker
     let mut worker = Worker::new(engines, config.max_concurrent);
 
-    // Attempt router connection; try each URL, go offline if all unavailable
+    // Connect to router
     let mut connection: Option<RouterConnection> = None;
     for url in &config.router_urls {
         match RouterConnection::connect(
@@ -183,9 +196,7 @@ async fn run_start(
                 connection = Some(conn);
                 break;
             }
-            Err(e) => {
-                tracing::warn!(%e, router = %url, "failed to connect to router");
-            }
+            Err(e) => tracing::warn!(%e, router = %url, "failed to connect"),
         }
     }
     if connection.is_none() {
@@ -196,27 +207,24 @@ async fn run_start(
         routers = ?config.router_urls,
         models = ?config.model_names,
         max_concurrent = config.max_concurrent,
-        insecure = config.insecure,
+        proxy_api = %config.proxy_api_url,
         online = connection.is_some(),
         "node ready"
     );
 
-    // Build shared context for event handlers
     let stats = Arc::new(NodeStats::new());
     let mut ctx = NodeContext {
         identity,
         config,
         tps: tps_map,
         stats: Arc::clone(&stats),
-        cache,
     };
 
-    // Channel for background model load results
     let (model_tx, mut model_rx) = mpsc::unbounded_channel::<ModelLoadResult>();
 
-    // Main event loop
     let mut stats_interval = tokio::time::interval(Duration::from_secs(60));
-    stats_interval.tick().await; // consume the immediate first tick
+    stats_interval.tick().await;
+
     loop {
         let event = tokio::select! {
             msg = recv_router_msg(&mut connection) => Event::RouterMsg(msg),
@@ -228,31 +236,27 @@ async fn run_start(
 
         match event {
             Event::RouterMsg(Ok(Some(msg))) => {
-                handle_router_message(msg, &mut worker, &mut connection, &mut ctx, &model_tx).await;
+                handle_router_message(msg, &mut worker, &mut connection, &mut ctx, &model_tx)
+                    .await;
             }
             Event::RouterMsg(Ok(None)) => {
-                // Stream closed cleanly
-                tracing::warn!("router stream closed, attempting reconnect");
-                if let Some(ref conn) = connection {
-                    conn.close();
-                }
+                tracing::warn!("router stream closed, reconnecting");
+                if let Some(ref c) = connection { c.close(); }
                 connection = tokio::select! {
-                    result = try_reconnect(&ctx, worker.capacity()) => result,
+                    r = try_reconnect(&ctx, worker.capacity()) => r,
                     _ = tokio::signal::ctrl_c() => {
-                        tracing::info!("shutdown signal received during reconnect");
+                        tracing::info!("shutdown during reconnect");
                         break;
                     }
                 };
             }
             Event::RouterMsg(Err(e)) => {
-                tracing::warn!(%e, "router communication error, attempting reconnect");
-                if let Some(ref conn) = connection {
-                    conn.close();
-                }
+                tracing::warn!(%e, "router error, reconnecting");
+                if let Some(ref c) = connection { c.close(); }
                 connection = tokio::select! {
-                    result = try_reconnect(&ctx, worker.capacity()) => result,
+                    r = try_reconnect(&ctx, worker.capacity()) => r,
                     _ = tokio::signal::ctrl_c() => {
-                        tracing::info!("shutdown signal received during reconnect");
+                        tracing::info!("shutdown during reconnect");
                         break;
                     }
                 };
@@ -260,64 +264,46 @@ async fn run_start(
             Event::TaskDone(completed) => {
                 handle_completed_task(completed, &connection, &ctx.stats);
             }
-            Event::ModelLoaded(loaded) => {
-                match loaded.result {
-                    Ok((engine, tps)) => {
-                        tracing::info!(
-                            model = %loaded.name,
-                            tps = %format!("{tps:.1}"),
-                            "model loaded successfully"
-                        );
-                        worker.add_engine(loaded.name.clone(), engine, loaded.model_type);
-                        ctx.tps.insert(loaded.name, tps);
-                    }
-                    Err(e) => {
-                        tracing::error!(model = %loaded.name, %e, "failed to load model");
-                    }
+            Event::ModelLoaded(loaded) => match loaded.result {
+                Ok((engine, tps)) => {
+                    tracing::info!(model = %loaded.name, tps = %format!("{tps:.1}"), "model loaded");
+                    worker.add_engine(loaded.name.clone(), engine, loaded.model_type);
+                    ctx.tps.insert(loaded.name, tps);
                 }
-            }
-            Event::StatsLog => {
-                ctx.stats.log_summary();
-            }
+                Err(e) => {
+                    tracing::error!(model = %loaded.name, %e, "model load failed");
+                }
+            },
+            Event::StatsLog => ctx.stats.log_summary(),
             Event::Shutdown => {
-                tracing::info!("shutdown signal received");
+                tracing::info!("shutdown signal");
                 break;
             }
         }
     }
 
-    // Graceful shutdown: drain in-flight tasks with 30s timeout
+    // Drain in-flight tasks (30s timeout)
     if worker.has_in_flight() {
         tracing::info!("draining in-flight tasks (30s timeout)");
-        let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
             tokio::select! {
-                Some(completed) = worker.next_completed() => {
-                    handle_completed_task(completed, &connection, &ctx.stats);
-                }
-                _ = tokio::time::sleep_until(drain_deadline) => {
-                    tracing::warn!("drain timeout reached, dropping remaining tasks");
+                Some(c) = worker.next_completed() => handle_completed_task(c, &connection, &ctx.stats),
+                _ = tokio::time::sleep_until(deadline) => {
+                    tracing::warn!("drain timeout, dropping remaining tasks");
                     break;
                 }
             }
-            if !worker.has_in_flight() {
-                break;
-            }
+            if !worker.has_in_flight() { break; }
         }
     }
 
-    if let Some(ref conn) = connection {
-        conn.close();
-    }
+    if let Some(ref c) = connection { c.close(); }
     tracing::info!("shutdown complete");
-
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Event types for the select! loop
-// ---------------------------------------------------------------------------
+// ── Events ────────────────────────────────────────────────────────────────────
 
 enum Event {
     RouterMsg(Result<Option<RouterMessage>, error::NodeError>),
@@ -327,39 +313,28 @@ enum Event {
     Shutdown,
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Receive a router message, or sleep 10s when offline (to allow periodic reconnect).
 async fn recv_router_msg(
     connection: &mut Option<RouterConnection>,
 ) -> Result<Option<RouterMessage>, error::NodeError> {
     match connection {
         Some(ref mut conn) => conn.recv().await,
         None => {
-            // Offline: sleep then signal a reconnect attempt
             tokio::time::sleep(Duration::from_secs(10)).await;
-            Err(error::NodeError::Network("offline, attempting reconnect".into()))
+            Err(error::NodeError::Network("offline, retrying".into()))
         }
     }
 }
 
-/// Attempt to reconnect to the router with exponential backoff.
-///
-/// Tries up to 5 rounds, iterating all router URLs per round (1s → 2s → 4s → 8s → 16s),
-/// then gives up and returns None so the main loop can fall back to the offline sleep-and-retry cycle.
 async fn try_reconnect(
     ctx: &NodeContext,
     capacity: network::protocol::Capacity,
 ) -> Option<RouterConnection> {
     let mut delay = Duration::from_secs(1);
-    let max_rounds = 5;
-
-    for round in 1..=max_rounds {
-        tracing::info!(round, delay_secs = delay.as_secs(), "attempting reconnect");
+    for round in 1..=5u32 {
+        tracing::info!(round, delay_secs = delay.as_secs(), "reconnecting");
         tokio::time::sleep(delay).await;
-
         for url in &ctx.config.router_urls {
             match RouterConnection::connect(
                 url,
@@ -372,23 +347,50 @@ async fn try_reconnect(
             .await
             {
                 Ok(conn) => {
-                    tracing::info!(node_id = %conn.node_id, router = %url, "reconnected to router");
+                    tracing::info!(node_id = %conn.node_id, router = %url, "reconnected");
                     return Some(conn);
                 }
-                Err(e) => {
-                    tracing::warn!(%e, router = %url, round, "reconnect attempt failed");
-                }
+                Err(e) => tracing::warn!(%e, router = %url, round, "reconnect failed"),
             }
         }
-
         delay *= 2;
     }
-
-    tracing::warn!("all reconnect attempts exhausted, running in offline mode");
+    tracing::warn!("all reconnect attempts exhausted, going offline");
     None
 }
 
-/// Handle a router message: dispatch tasks, respond to pings, sign challenges, etc.
+/// Create a cloud inference engine for a Dria model name.
+async fn create_cloud_engine(
+    model_name: &str,
+    model_type: ModelType,
+    config: &Config,
+) -> Result<(inference::InferenceEngine, f64), error::NodeError> {
+    let cloud_model = config.resolve_cloud_model(model_name);
+    let is_multimodal = model_type != ModelType::Text;
+
+    let engine = inference::InferenceEngine::new(
+        &config.proxy_api_url,
+        &config.proxy_api_key,
+        &cloud_model,
+        is_multimodal,
+    )?;
+
+    tracing::info!(
+        dria_model = %model_name,
+        cloud_model = %cloud_model,
+        "testing API connectivity"
+    );
+
+    // Run benchmark in blocking thread
+    let model_name_owned = model_name.to_string();
+    let tps = tokio::task::spawn_blocking(move || engine.benchmark(&model_name_owned).map(|r| (engine, r.generation_tps)))
+        .await
+        .map_err(|e| error::NodeError::Inference(format!("benchmark join: {e}")))?
+        .map(|(engine, tps)| (engine, tps))?;
+
+    Ok(tps)
+}
+
 async fn handle_router_message(
     msg: RouterMessage,
     worker: &mut Worker,
@@ -407,31 +409,35 @@ async fn handle_router_message(
             stream,
             response_format,
         } => {
-            tracing::info!(%task_id, %model, stream, "received task assignment");
+            tracing::info!(%task_id, %model, stream, "task assigned");
             let stream_tx = if stream {
-                connection.as_ref().map(|conn| conn.sender())
+                connection.as_ref().map(|c| c.sender())
             } else {
                 None
             };
-            match worker.try_accept(task_id, &model, messages, max_tokens, temperature, validation, stream, stream_tx, response_format)
-            {
-                Ok(()) => {
-                    tracing::debug!(%task_id, "task accepted");
-                }
+            match worker.try_accept(
+                task_id,
+                &model,
+                messages,
+                max_tokens,
+                temperature,
+                validation,
+                stream,
+                stream_tx,
+                response_format,
+            ) {
+                Ok(()) => tracing::debug!(%task_id, "task accepted"),
                 Err(reason) => {
                     ctx.stats.record_rejected();
                     tracing::warn!(%task_id, ?reason, "task rejected");
                     if let Some(ref conn) = connection {
-                        let reject = NodeMessage::TaskRejected { task_id, reason };
-                        if let Err(e) = conn.send(reject) {
-                            tracing::error!(%e, "failed to send rejection");
-                        }
+                        let _ = conn.send(NodeMessage::TaskRejected { task_id, reason });
                     }
                 }
             }
         }
         RouterMessage::Ping => {
-            tracing::debug!("received ping");
+            tracing::debug!("ping");
             if let Some(ref conn) = connection {
                 let status = NodeMessage::StatusUpdate {
                     models: worker.model_names(),
@@ -440,20 +446,20 @@ async fn handle_router_message(
                     stats: Some(ctx.stats.snapshot()),
                 };
                 if let Err(e) = conn.send(status) {
-                    tracing::error!(%e, "failed to send status update");
+                    tracing::error!(%e, "failed to send status");
                 }
             }
         }
         RouterMessage::Challenge { challenge } => {
-            tracing::debug!("received challenge, signing response");
+            tracing::debug!("challenge received");
             let (sig, recid) = ctx.identity.sign(&challenge);
             if let Some(ref conn) = connection {
-                let response = NodeMessage::ChallengeResponse {
+                let resp = NodeMessage::ChallengeResponse {
                     challenge,
                     signature: sig.serialize().to_vec(),
                     recovery_id: recid.serialize(),
                 };
-                if let Err(e) = conn.send(response) {
+                if let Err(e) = conn.send(resp) {
                     tracing::error!(%e, "failed to send challenge response");
                 }
             }
@@ -466,7 +472,7 @@ async fn handle_router_message(
             logprob_every_n,
             logprob_top_k,
         } => {
-            tracing::info!(%validation_id, %model, "received validation task");
+            tracing::info!(%validation_id, %model, "validation task");
             match worker.try_accept_validation(
                 validation_id,
                 &model,
@@ -480,141 +486,63 @@ async fn handle_router_message(
             }
         }
         RouterMessage::ModelRegistryUpdate { entries } => {
-            tracing::info!(count = entries.len(), "received model registry update");
+            tracing::info!(count = entries.len(), "model registry update");
 
-            // Compute desired set from entries
-            let desired: HashMap<String, _> = entries
-                .iter()
-                .map(|e| (e.name.clone(), e))
-                .collect();
+            let desired: HashMap<&str, _> = entries.iter().map(|e| (e.name.as_str(), e)).collect();
 
-            // Remove models not in the desired set
-            let current = worker.model_names();
-            for name in &current {
-                if !desired.contains_key(name) {
-                    tracing::info!(model = %name, "removing model (not in registry)");
+            // Remove stale models
+            for name in &worker.model_names() {
+                if !desired.contains_key(name.as_str()) {
+                    tracing::info!(model = %name, "removing stale model");
                     worker.remove_engine(name);
                     ctx.tps.remove(name);
                 }
             }
 
-            // Spawn background download+load for new models
-            for entry in &entries {
-                if !worker.has_model(&entry.name) {
-                    let spec = ModelSpec::from_registry_entry(entry);
-                    let cache = ctx.cache.clone();
-                    let gpu_layers = ctx.config.gpu_layers;
-                    let max_context = ctx.config.max_context;
-                    let kv_type = parse_kv_quant(&ctx.config.kv_quant).ok();
-                    let tx = model_tx.clone();
-                    let name = entry.name.clone();
-                    let model_type = entry.model_type;
+            // Create engines for new models — collect all needed data before spawning
+            let new_models: Vec<_> = entries
+                .iter()
+                .filter(|e| !worker.has_model(&e.name))
+                .map(|e| {
+                    (
+                        e.name.clone(),
+                        e.model_type,
+                        ModelSpec::from_registry_entry(e),
+                        ctx.config.proxy_api_url.clone(),
+                        ctx.config.proxy_api_key.clone(),
+                        ctx.config.resolve_cloud_model(&e.name),
+                    )
+                })
+                .collect();
 
-                    tracing::info!(model = %name, "spawning background model download+load");
-                    tokio::spawn(async move {
-                        let result = download_and_load_model(&spec, &cache, gpu_layers, max_context, kv_type).await;
-                        let _ = tx.send(ModelLoadResult { name, model_type, result });
-                    });
-                }
+            for (name, model_type, spec, api_url, api_key, cloud_model) in new_models {
+                let tx = model_tx.clone();
+                let name_clone = name.clone();
+
+                tracing::info!(model = %name, "spawning cloud engine for new model");
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        let is_multimodal = spec.model_type != ModelType::Text;
+                        let engine = inference::InferenceEngine::new(
+                            &api_url,
+                            &api_key,
+                            &cloud_model,
+                            is_multimodal,
+                        )?;
+                        let tps = engine.benchmark(&name_clone)?.generation_tps;
+                        Ok::<_, error::NodeError>((engine, tps))
+                    })
+                    .await
+                    .map_err(|e| error::NodeError::Inference(format!("join: {e}")))
+                    .and_then(|r| r);
+
+                    let _ = tx.send(ModelLoadResult { name, model_type, result });
+                });
             }
         }
     }
 }
 
-/// Download (if needed), verify, cache, load, and benchmark a model.
-///
-/// Returns the loaded engine and its benchmark TPS.
-async fn download_and_load_model(
-    spec: &ModelSpec,
-    cache: &ModelCache,
-    gpu_layers: i32,
-    max_context: Option<u32>,
-    kv_cache_type: Option<KvCacheType>,
-) -> Result<(inference::InferenceEngine, f64), error::NodeError> {
-    let model_name = spec.name.clone();
-
-    // Check local cache first, verify integrity if SHA is available
-    let model_path = if let Some(path) = cache.get_local_path(spec) {
-        if let Some(ref expected_sha) = spec.sha256 {
-            if ModelCache::verify_sha256(&path, expected_sha).unwrap_or(false) {
-                tracing::info!(model = %model_name, path = %path.display(), "model found in cache (verified)");
-                path
-            } else {
-                tracing::warn!(model = %model_name, "cached model failed integrity check, re-downloading");
-                std::fs::remove_file(&path).ok();
-                download_and_link(spec, cache, &model_name).await?
-            }
-        } else {
-            tracing::info!(model = %model_name, path = %path.display(), "model found in cache");
-            path
-        }
-    } else {
-        download_and_link(spec, cache, &model_name).await?
-    };
-
-    // Download mmproj if specified (for vision/audio models)
-    let mmproj_path = if spec.hf_mmproj_file.is_some() {
-        if let Some(path) = cache.get_mmproj_path(spec) {
-            tracing::info!(model = %model_name, path = %path.display(), "mmproj found in cache");
-            Some(path)
-        } else {
-            let hf_path = ModelDownloader::download_mmproj(spec).await?;
-            Some(cache.link_mmproj(spec, &hf_path)?)
-        }
-    } else {
-        None
-    };
-
-    // Load model and run benchmark in blocking thread
-    let (engine, tps) = tokio::task::spawn_blocking(move || {
-        let engine = inference::InferenceEngine::load(&model_path, gpu_layers, mmproj_path.as_deref(), max_context, kv_cache_type)?;
-        let tps_result = engine.benchmark(&model_name)?;
-        Ok::<_, error::NodeError>((engine, tps_result.generation_tps))
-    })
-    .await
-    .map_err(|e| error::NodeError::Inference(format!("task join error: {e}")))?
-    ?;
-
-    Ok((engine, tps))
-}
-
-/// Download a model from HuggingFace, verify SHA-256, and link into cache.
-async fn download_and_link(
-    spec: &ModelSpec,
-    cache: &ModelCache,
-    model_name: &str,
-) -> Result<std::path::PathBuf, error::NodeError> {
-    let hf_path = ModelDownloader::download(spec).await?;
-
-    if let Some(ref expected_sha) = spec.sha256 {
-        tracing::info!(model = %model_name, "verifying SHA-256");
-        if !ModelCache::verify_sha256(&hf_path, expected_sha)? {
-            return Err(error::NodeError::Model(format!(
-                "SHA-256 mismatch for model {model_name}"
-            )));
-        }
-    }
-
-    cache.link_model(spec, &hf_path)
-}
-
-/// Parse a KV cache quantization string (e.g. "q8_0", "q4_0", "f16") into a `KvCacheType`.
-fn parse_kv_quant(s: &str) -> Result<KvCacheType, error::NodeError> {
-    match s.to_lowercase().as_str() {
-        "f16" => Ok(KvCacheType::F16),
-        "f32" => Ok(KvCacheType::F32),
-        "q8_0" => Ok(KvCacheType::Q8_0),
-        "q4_0" => Ok(KvCacheType::Q4_0),
-        "q4_1" => Ok(KvCacheType::Q4_1),
-        "q5_0" => Ok(KvCacheType::Q5_0),
-        "q5_1" => Ok(KvCacheType::Q5_1),
-        other => Err(error::NodeError::Config(format!(
-            "unknown kv-quant type '{other}' (supported: f16, f32, q8_0, q4_0, q4_1, q5_0, q5_1)"
-        ))),
-    }
-}
-
-/// Handle a completed inference task: send result or log if offline.
 fn handle_completed_task(
     completed: CompletedTask,
     connection: &Option<RouterConnection>,
@@ -627,23 +555,19 @@ fn handle_completed_task(
                 _ => 0,
             };
             stats.record_completed(tokens);
-            tracing::info!(task_id = %completed.task_id, stream = completed.stream, "task completed");
+            tracing::info!(task_id = %completed.task_id, stream = completed.stream, "task complete");
             if completed.stream {
-                // Streaming tasks already sent tokens inline; nothing more to send.
-                return;
+                return; // streaming tasks already sent tokens inline
             }
             if let Some(ref conn) = connection {
                 if let Err(e) = conn.send(msg) {
                     tracing::error!(%e, task_id = %completed.task_id, "failed to send result");
                 }
-            } else {
-                tracing::warn!(task_id = %completed.task_id, "task completed but offline, result dropped");
             }
         }
         Err(e) => {
             stats.record_failed();
             tracing::error!(%e, task_id = %completed.task_id, "task failed");
-            // Propagate error back to router so it can retry on another node
             if let Some(ref conn) = connection {
                 let _ = conn.send(NodeMessage::StreamError {
                     task_id: completed.task_id,

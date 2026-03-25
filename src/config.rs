@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -5,7 +6,11 @@ use clap::{Parser, Subcommand};
 use crate::error::NodeError;
 
 #[derive(Parser)]
-#[command(name = "dria-node", version, about = "Dria Compute Node")]
+#[command(
+    name = "dria-node",
+    version,
+    about = "Dria Compute Node — Cloud API Proxy Edition"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -13,24 +18,16 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Interactive setup: pick a model, download it, and run a test
-    Setup {
-        /// Data directory
-        #[arg(long, env = "DRIA_DATA_DIR")]
-        data_dir: Option<PathBuf>,
+    /// Show proxy configuration and verify API connectivity
+    Setup,
 
-        /// Number of GPU layers to offload (-1 = all, 0 = CPU only)
-        #[arg(long, env = "DRIA_GPU_LAYERS", default_value = "0")]
-        gpu_layers: i32,
-    },
-
-    /// Start the compute node
+    /// Start the compute node (proxies inference to a cloud API)
     Start {
-        /// Wallet secret key (hex-encoded, 32 bytes)
+        /// Dria wallet secret key (hex-encoded, 32 bytes)
         #[arg(long, env = "DRIA_WALLET")]
         wallet: String,
 
-        /// Model(s) to serve (comma-separated shortnames, e.g. "qwen3.5:9b,lfm2.5:1.2b")
+        /// Dria model name(s) to advertise (comma-separated, e.g. "qwen3.5:9b,lfm2.5:1.2b")
         #[arg(long, env = "DRIA_MODELS")]
         model: String,
 
@@ -38,102 +35,96 @@ pub enum Command {
         #[arg(long, env = "DRIA_ROUTER_URL", default_value = "quic.dria.co:4001")]
         router_url: String,
 
-        /// Number of GPU layers to offload (-1 = all, 0 = CPU only)
-        #[arg(long, env = "DRIA_GPU_LAYERS", default_value = "0")]
-        gpu_layers: i32,
-
         /// Maximum concurrent inference requests
-        #[arg(long, env = "DRIA_MAX_CONCURRENT", default_value = "1")]
+        #[arg(long, env = "DRIA_MAX_CONCURRENT", default_value = "4")]
         max_concurrent: usize,
 
-        /// Data directory
-        #[arg(long, env = "DRIA_DATA_DIR")]
-        data_dir: Option<PathBuf>,
+        /// Cloud API base URL (OpenAI-compatible, e.g. https://api.hyperbolic.xyz/v1)
+        #[arg(long, env = "PROXY_API_URL", default_value = "https://api.hyperbolic.xyz/v1")]
+        proxy_api_url: String,
 
-        /// Override GGUF quantization (e.g. Q8_0, Q5_K_M, Q6_K). Defaults to the registry value (usually Q4_K_M).
-        #[arg(long, env = "DRIA_QUANT")]
-        quant: Option<String>,
+        /// Cloud API key
+        #[arg(long, env = "PROXY_API_KEY")]
+        proxy_api_key: String,
 
-        /// Skip TLS certificate verification (for development/testing)
+        /// Default cloud model to use for all Dria model names
+        #[arg(
+            long,
+            env = "PROXY_DEFAULT_MODEL",
+            default_value = "meta-llama/Llama-3.3-70B-Instruct"
+        )]
+        proxy_default_model: String,
+
+        /// Optional per-model mapping: "dria_name=cloud_name" entries, comma-separated.
+        /// E.g. "qwen3.5:9b=Qwen/Qwen2.5-7B-Instruct,lfm2.5:1.2b=Qwen/Qwen2.5-1.5B-Instruct"
+        #[arg(long, env = "PROXY_MODELS", default_value = "")]
+        proxy_models: String,
+
+        /// Skip TLS certificate verification (development only)
         #[arg(long, env = "DRIA_INSECURE")]
         insecure: bool,
 
         /// Skip automatic update check on startup
         #[arg(long, env = "DRIA_SKIP_UPDATE")]
         skip_update: bool,
-
-        /// Maximum context window size (tokens). When set, engines use min(model_native, this value).
-        /// When unset, engines use the model's full native context window.
-        #[arg(long, env = "DRIA_CONTEXT_SIZE")]
-        context_size: Option<u32>,
-
-        /// KV cache quantization type (q8_0, q4_0, f16). Default: q8_0 (halves KV memory vs f16).
-        #[arg(long, env = "DRIA_KV_QUANT", default_value = "q8_0")]
-        kv_quant: String,
     },
 }
 
-/// Parsed and validated configuration for the node.
+/// Parsed and validated runtime configuration.
 pub struct Config {
     pub secret_key_hex: String,
     pub model_names: Vec<String>,
     pub router_urls: Vec<String>,
-    pub gpu_layers: i32,
     pub max_concurrent: usize,
     pub data_dir: PathBuf,
-    pub models_dir: PathBuf,
-    pub quant: Option<String>,
+    /// Cloud API base URL (no trailing slash).
+    pub proxy_api_url: String,
+    /// Cloud API authentication key.
+    pub proxy_api_key: String,
+    /// Default cloud model name used when no per-model mapping is found.
+    pub proxy_default_model: String,
+    /// Dria model name → cloud model name overrides.
+    pub proxy_model_map: HashMap<String, String>,
     pub insecure: bool,
     pub skip_update: bool,
-    pub max_context: Option<u32>,
-    pub kv_quant: String,
 }
 
 impl Config {
-    /// Create a Config from the `start` subcommand arguments.
     #[allow(clippy::too_many_arguments)]
     pub fn from_start_args(
         wallet: String,
         model: String,
         router_url: String,
-        gpu_layers: i32,
         max_concurrent: usize,
-        data_dir: Option<PathBuf>,
-        quant: Option<String>,
+        proxy_api_url: String,
+        proxy_api_key: String,
+        proxy_default_model: String,
+        proxy_models: String,
         insecure: bool,
         skip_update: bool,
-        max_context: Option<u32>,
-        kv_quant: String,
     ) -> Result<Self, NodeError> {
         // Validate wallet key
         let secret_key_hex = wallet.strip_prefix("0x").unwrap_or(&wallet).to_string();
         if secret_key_hex.len() != 64 {
             return Err(NodeError::Config(format!(
-                "wallet secret key must be 64 hex chars, got {}",
+                "wallet key must be 64 hex chars (got {})",
                 secret_key_hex.len()
             )));
         }
         hex::decode(&secret_key_hex)
             .map_err(|e| NodeError::Config(format!("wallet key is not valid hex: {e}")))?;
 
-        // Parse model names
+        // Parse Dria model names
         let model_names: Vec<String> = model
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
         if model_names.is_empty() {
-            return Err(NodeError::Config("at least one model must be specified".into()));
+            return Err(NodeError::Config(
+                "at least one model must be specified (--model)".into(),
+            ));
         }
-
-        // Resolve data directory
-        let data_dir = match data_dir {
-            Some(d) => d,
-            None => dirs::home_dir()
-                .ok_or_else(|| NodeError::Config("could not determine home directory".into()))?
-                .join(".dria"),
-        };
-        let models_dir = data_dir.join("models");
 
         if max_concurrent == 0 {
             return Err(NodeError::Config("max-concurrent must be >= 1".into()));
@@ -146,184 +137,205 @@ impl Config {
             .filter(|s| !s.is_empty())
             .collect();
         if router_urls.is_empty() {
-            return Err(NodeError::Config("at least one router URL must be specified".into()));
+            return Err(NodeError::Config("router URL must not be empty".into()));
         }
+
+        // Validate proxy API key
+        if proxy_api_key.trim().is_empty() {
+            return Err(NodeError::Config(
+                "PROXY_API_KEY is required (set via --proxy-api-key or env var)".into(),
+            ));
+        }
+
+        // Parse per-model mapping: "dria_name=cloud_name,..."
+        let proxy_model_map = parse_model_map(&proxy_models);
+
+        let data_dir = dirs::home_dir()
+            .ok_or_else(|| NodeError::Config("could not determine home directory".into()))?
+            .join(".dria");
 
         Ok(Config {
             secret_key_hex,
             model_names,
             router_urls,
-            gpu_layers,
             max_concurrent,
             data_dir,
-            models_dir,
-            quant,
+            proxy_api_url: proxy_api_url.trim_end_matches('/').to_string(),
+            proxy_api_key,
+            proxy_default_model,
+            proxy_model_map,
             insecure,
             skip_update,
-            max_context,
-            kv_quant,
         })
     }
+
+    /// Resolve which cloud model name to use for a given Dria model name.
+    pub fn resolve_cloud_model(&self, dria_model: &str) -> String {
+        self.proxy_model_map
+            .get(dria_model)
+            .cloned()
+            .unwrap_or_else(|| self.proxy_default_model.clone())
+    }
+}
+
+/// Parse "a=b,c=d" into a HashMap.
+fn parse_model_map(s: &str) -> HashMap<String, String> {
+    s.split(',')
+        .filter_map(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            let key = parts.next()?.trim();
+            let val = parts.next()?.trim();
+            if key.is_empty() || val.is_empty() {
+                None
+            } else {
+                Some((key.to_string(), val.to_string()))
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_config_from_valid_args() {
-        let cfg = Config::from_start_args(
-            "0x6472696164726961647269616472696164726961647269616472696164726961".into(),
-            "qwen3.5:9b, lfm2.5:1.2b".into(),
-            "quic.dria.co:4001".into(),
-            0,
-            1,
-            Some("/tmp/dria-test".into()),
-            None,
-            false,
-            false,
-            None,
-            "q8_0".into(),
-        )
-        .unwrap();
+    fn valid_wallet() -> String {
+        "6472696164726961647269616472696164726961647269616472696164726961".into()
+    }
 
-        assert_eq!(cfg.model_names, vec!["qwen3.5:9b", "lfm2.5:1.2b"]);
-        assert_eq!(
-            cfg.secret_key_hex,
-            "6472696164726961647269616472696164726961647269616472696164726961"
-        );
-        assert_eq!(cfg.models_dir, PathBuf::from("/tmp/dria-test/models"));
-        assert_eq!(cfg.router_urls, vec!["quic.dria.co:4001"]);
+    fn make_cfg(extra: Option<(&str, &str)>) -> Result<Config, NodeError> {
+        let proxy_models = extra
+            .map(|(k, v)| format!("{k}={v}"))
+            .unwrap_or_default();
+        Config::from_start_args(
+            valid_wallet(),
+            "qwen3.5:9b".into(),
+            "quic.dria.co:4001".into(),
+            4,
+            "https://api.hyperbolic.xyz/v1".into(),
+            "test-key".into(),
+            "meta-llama/Llama-3.3-70B-Instruct".into(),
+            proxy_models,
+            false,
+            true,
+        )
     }
 
     #[test]
-    fn test_config_invalid_wallet_length() {
-        let result = Config::from_start_args(
+    fn test_config_valid() {
+        let cfg = make_cfg(None).unwrap();
+        assert_eq!(cfg.model_names, vec!["qwen3.5:9b"]);
+        assert_eq!(cfg.max_concurrent, 4);
+        assert!(cfg.skip_update);
+    }
+
+    #[test]
+    fn test_config_wallet_too_short() {
+        let r = Config::from_start_args(
             "0xabcd".into(),
             "qwen3.5:9b".into(),
             "quic.dria.co:4001".into(),
-            0,
             1,
-            None,
-            None,
-            false,
-            false,
-            None,
-            "q8_0".into(),
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_config_invalid_wallet_hex() {
-        let result = Config::from_start_args(
-            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz".into(),
-            "qwen3.5:9b".into(),
-            "quic.dria.co:4001".into(),
-            0,
-            1,
-            None,
-            None,
-            false,
-            false,
-            None,
-            "q8_0".into(),
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_config_empty_model() {
-        let result = Config::from_start_args(
-            "6472696164726961647269616472696164726961647269616472696164726961".into(),
+            "https://api.example.com/v1".into(),
+            "key".into(),
+            "model".into(),
             "".into(),
-            "quic.dria.co:4001".into(),
-            0,
-            1,
-            None,
-            None,
             false,
             false,
-            None,
-            "q8_0".into(),
         );
-        assert!(result.is_err());
+        assert!(r.is_err());
     }
 
     #[test]
-    fn test_config_zero_concurrency() {
-        let result = Config::from_start_args(
-            "6472696164726961647269616472696164726961647269616472696164726961".into(),
+    fn test_config_empty_proxy_key() {
+        let r = Config::from_start_args(
+            valid_wallet(),
             "qwen3.5:9b".into(),
             "quic.dria.co:4001".into(),
-            0,
-            0,
-            None,
-            None,
+            1,
+            "https://api.example.com/v1".into(),
+            "".into(),
+            "model".into(),
+            "".into(),
             false,
             false,
-            None,
-            "q8_0".into(),
         );
-        assert!(result.is_err());
+        assert!(r.is_err());
     }
 
     #[test]
-    fn test_config_comma_separated_router_urls() {
-        let cfg = Config::from_start_args(
-            "6472696164726961647269616472696164726961647269616472696164726961".into(),
+    fn test_config_zero_concurrent() {
+        let r = Config::from_start_args(
+            valid_wallet(),
             "qwen3.5:9b".into(),
-            "https://router1.dria.co, https://router2.dria.co".into(),
+            "quic.dria.co:4001".into(),
             0,
-            1,
-            None,
-            None,
+            "https://api.example.com/v1".into(),
+            "key".into(),
+            "model".into(),
+            "".into(),
             false,
             false,
-            None,
-            "q8_0".into(),
-        )
-        .unwrap();
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_resolve_cloud_model_default() {
+        let cfg = make_cfg(None).unwrap();
         assert_eq!(
-            cfg.router_urls,
-            vec!["https://router1.dria.co", "https://router2.dria.co"]
+            cfg.resolve_cloud_model("unknown:model"),
+            "meta-llama/Llama-3.3-70B-Instruct"
         );
     }
 
     #[test]
-    fn test_config_empty_router_url() {
-        let result = Config::from_start_args(
-            "6472696164726961647269616472696164726961647269616472696164726961".into(),
-            "qwen3.5:9b".into(),
-            "".into(),
-            0,
-            1,
-            None,
-            None,
-            false,
-            false,
-            None,
-            "q8_0".into(),
+    fn test_resolve_cloud_model_mapped() {
+        let cfg = make_cfg(Some(("qwen3.5:9b", "Qwen/Qwen2.5-7B-Instruct"))).unwrap();
+        assert_eq!(
+            cfg.resolve_cloud_model("qwen3.5:9b"),
+            "Qwen/Qwen2.5-7B-Instruct"
         );
-        assert!(result.is_err());
+        assert_eq!(
+            cfg.resolve_cloud_model("other:model"),
+            "meta-llama/Llama-3.3-70B-Instruct"
+        );
     }
 
     #[test]
-    fn test_config_insecure_flag() {
+    fn test_parse_model_map_valid() {
+        let m = parse_model_map("a:1=X/Y,b:2=Z/W");
+        assert_eq!(m.get("a:1").map(|s| s.as_str()), Some("X/Y"));
+        assert_eq!(m.get("b:2").map(|s| s.as_str()), Some("Z/W"));
+    }
+
+    #[test]
+    fn test_parse_model_map_empty() {
+        let m = parse_model_map("");
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn test_parse_model_map_ignores_bad_entries() {
+        let m = parse_model_map("no-equals,a=b,=empty");
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.get("a").map(|s| s.as_str()), Some("b"));
+    }
+
+    #[test]
+    fn test_proxy_api_url_strips_trailing_slash() {
         let cfg = Config::from_start_args(
-            "6472696164726961647269616472696164726961647269616472696164726961".into(),
+            valid_wallet(),
             "qwen3.5:9b".into(),
             "quic.dria.co:4001".into(),
-            0,
             1,
-            None,
-            None,
-            true,
+            "https://api.example.com/v1/".into(),
+            "key".into(),
+            "model".into(),
+            "".into(),
             false,
-            None,
-            "q8_0".into(),
+            false,
         )
         .unwrap();
-        assert!(cfg.insecure);
+        assert_eq!(cfg.proxy_api_url, "https://api.example.com/v1");
     }
 }

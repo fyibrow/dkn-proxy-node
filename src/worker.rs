@@ -137,22 +137,20 @@ impl Worker {
             }
         }
 
-        // Convert response_format to GBNF grammar
-        let grammar = match response_format {
+        // Convert response_format to OpenAI-style JSON value for the cloud API.
+        let response_format_json = match response_format {
             Some(ResponseFormat::JsonObject) => {
-                let schema = r#"{"type": "object"}"#;
-                Some(
-                    llama_cpp_2::json_schema_to_grammar(schema)
-                        .map_err(|e| RejectReason::InvalidRequest(format!("json grammar error: {e}")))?,
-                )
+                Some(serde_json::json!({"type": "json_object"}))
             }
             Some(ResponseFormat::JsonSchema { ref json_schema }) => {
-                let schema_str = serde_json::to_string(&json_schema.schema)
-                    .map_err(|e| RejectReason::InvalidRequest(format!("invalid schema: {e}")))?;
-                Some(
-                    llama_cpp_2::json_schema_to_grammar(&schema_str)
-                        .map_err(|e| RejectReason::InvalidRequest(format!("schema conversion failed: {e}")))?,
-                )
+                Some(serde_json::json!({
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "response",
+                        "strict": true,
+                        "schema": json_schema.schema
+                    }
+                }))
             }
             None => None,
         };
@@ -168,7 +166,7 @@ impl Worker {
                 .map(|v| v.logprob_every_n)
                 .unwrap_or(0),
             logprob_top_k: validation.as_ref().map(|v| v.logprob_top_k).unwrap_or(5),
-            grammar,
+            response_format: response_format_json,
         };
 
         let capacity = Arc::clone(&self.capacity);
