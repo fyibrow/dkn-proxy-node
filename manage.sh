@@ -39,6 +39,94 @@ find_wallet_dirs() {
     find "$NODES_DIR" -maxdepth 1 -type d -name "dria-node-0x*" 2>/dev/null | sort
 }
 
+# ── Migration helpers ──────────────────────────────────────────────────────────
+
+# Returns 0 (true) if compose file uses old firstbatch image
+_is_old_format() {
+    grep -q "firstbatch/dkn-compute-node\|dkn-compute-node:latest" "$1" 2>/dev/null
+}
+
+# Derive Ethereum address from 64-char hex private key using Node.js/ethers
+_derive_address() {
+    local key="$1"
+    local gen_dir="$NODES_DIR/.wallet-gen"
+
+    if command -v node &>/dev/null && [ -d "$gen_dir/node_modules/ethers" ]; then
+        node -e "
+const {Wallet}=require('$gen_dir/node_modules/ethers');
+try{process.stdout.write(new Wallet('0x$key').address);}
+catch(e){process.stdout.write('0x'+'$key'.slice(0,40));}
+" 2>/dev/null || echo "0x${key:0:40}"
+    else
+        echo "0x${key:0:40}"
+    fi
+}
+
+# Rewrite a compose file from old format to new proxy format
+# Usage: _migrate_compose <compose_file>
+_migrate_compose() {
+    local compose="$1"
+    local dir; dir=$(dirname "$compose")
+
+    [ -f "$PROXY_ENV" ] || { warn "No proxy.env at $PROXY_ENV — run deploy.sh first"; return 1; }
+
+    # Extract wallet private key from old compose
+    local raw
+    raw=$(grep -E '(DKN_WALLET_SECRET_KEY|DRIA_WALLET)[[:space:]]*[:=][[:space:]]*' "$compose" 2>/dev/null \
+          | grep -oE '(0x)?[a-fA-F0-9]{64}' | head -1)
+    [ -n "$raw" ] || { warn "Cannot extract wallet key from $compose"; return 1; }
+
+    local key="${raw#0x}"
+    local addr; addr=$(_derive_address "$key")
+    local short="${addr:2:8}"
+
+    local node_count
+    node_count=$(_load_env_var NODE_COUNT)
+    node_count="${node_count:-5}"
+
+    # Stop old containers first
+    info "Stopping old containers in $(basename "$dir")..."
+    (cd "$dir" && docker compose down 2>/dev/null) || true
+
+    # Write new compose file
+    {
+        echo "# dria-proxy-node — wallet: ${addr}"
+        echo "# migrated from old format: $(date)"
+        echo "# services: ${node_count}"
+        echo "networks:"
+        echo "  dria-nodes:"
+        echo "    external: true"
+        echo ""
+        echo "services:"
+    } > "$compose"
+
+    for i in $(seq 1 "$node_count"); do
+        cat >> "$compose" << SVC
+  node_${i}:
+    image: "${DOCKER_IMAGE}"
+    container_name: dria-${short}-${i}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - ../proxy.env
+    environment:
+      DRIA_WALLET: "0x${key}"
+    restart: "on-failure"
+    networks:
+      - dria-nodes
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+SVC
+    done
+
+    log "Migrated $(basename "$dir") → ${node_count} service(s) using ${DOCKER_IMAGE}"
+    return 0
+}
+
 # ── Start (sequential with delay) ─────────────────────────────────────────────
 cmd_start() {
     local filter="${1:-}"
@@ -59,6 +147,7 @@ cmd_start() {
     fi
 
     local started=0
+    local migrated=0
     for compose in "${composes[@]}"; do
         local dir; dir=$(dirname "$compose")
         local name; name=$(basename "$dir")
@@ -68,6 +157,17 @@ cmd_start() {
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         info "Starting node [$started/$total]: $name"
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+        # Auto-migrate old format compose files before starting
+        if _is_old_format "$compose"; then
+            warn "Old format detected (firstbatch/dkn-compute-node) — auto-migrating..."
+            if _migrate_compose "$compose"; then
+                (( migrated++ )) || true
+            else
+                warn "Migration failed — skipping $name"
+                continue
+            fi
+        fi
 
         if (cd "$dir" && docker compose up -d --remove-orphans); then
             log "$name started"
@@ -89,7 +189,7 @@ cmd_start() {
 
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    log "All $total wallet folder(s) started"
+    log "All $total wallet folder(s) started ($migrated auto-migrated from old format)"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     cmd_status
@@ -133,6 +233,12 @@ cmd_restart() {
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         info "Restarting node [$current/$total]: $name"
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+        # Auto-migrate old format before restarting
+        if _is_old_format "$compose"; then
+            warn "Old format detected — auto-migrating..."
+            _migrate_compose "$compose" || { warn "Migration failed — skipping $name"; continue; }
+        fi
 
         if (cd "$dir" && docker compose down && docker compose up -d); then
             log "$name restarted"
@@ -345,6 +451,40 @@ cmd_scale() {
     done < <(find_wallet_dirs)
 }
 
+# ── Migrate all old-format compose files ──────────────────────────────────────
+cmd_migrate() {
+    local filter="${1:-}"
+    local count=0
+    local skipped=0
+
+    info "Scanning for old-format compose files (firstbatch/dkn-compute-node)..."
+
+    while IFS= read -r compose; do
+        local name; name=$(basename "$(dirname "$compose")")
+        [ -n "$filter" ] && [[ "$name" != *"$filter"* ]] && continue
+
+        if ! _is_old_format "$compose"; then
+            (( skipped++ )) || true
+            continue
+        fi
+
+        info "Migrating $name..."
+        if _migrate_compose "$compose"; then
+            (( count++ )) || true
+        else
+            warn "Failed to migrate $name"
+        fi
+    done < <(find_composes)
+
+    echo ""
+    if [ "$count" -eq 0 ] && [ "$skipped" -gt 0 ]; then
+        log "All $skipped compose file(s) already in new format — nothing to migrate"
+    else
+        log "Migrated: $count  |  Already up-to-date: $skipped"
+        [ "$count" -gt 0 ] && warn "Run '$(basename "$0") start' to start the migrated nodes"
+    fi
+}
+
 # ── Prune stopped containers ──────────────────────────────────────────────────
 cmd_prune() {
     docker container prune -f --filter "name=dria-"
@@ -381,6 +521,7 @@ cat << 'EOF'
     update-key                Update VIKEY_API_KEY / PROXY_API_KEY in all configs
     update                    Pull latest source, rebuild image, restart
     rebuild                   Rebuild Docker image from local source and restart
+    migrate [filter]          Convert old firstbatch/dkn-compute-node compose files to new format
     prune                     Remove stopped Dria containers
 
   Examples:
@@ -413,6 +554,7 @@ main() {
     update-key) cmd_update_key ;;
     update)     cmd_update ;;
     rebuild)    cmd_rebuild ;;
+    migrate)    cmd_migrate "${1:-}" ;;
     prune)      cmd_prune ;;
     scale)      cmd_scale "${1:-}" "${2:-}" ;;
     help|-h|--help) usage ;;
