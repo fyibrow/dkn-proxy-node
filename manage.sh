@@ -100,11 +100,12 @@ _migrate_compose() {
         echo "services:"
     } > "$compose"
 
+    # container_name omitted — Docker Compose auto-generates from folder name:
+    #   {folder}-node_{i}-1  e.g. dria-node-0x040dc19a...-node_1-1
     for i in $(seq 1 "$node_count"); do
         cat >> "$compose" << SVC
   node_${i}:
     image: "${DOCKER_IMAGE}"
-    container_name: dria-${short}-${i}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     env_file:
@@ -333,12 +334,12 @@ cmd_status() {
         return
     fi
 
-    # Per-wallet breakdown
+    # Per-wallet breakdown — filter uses lowercase folder name (Compose normalises to lowercase)
     while IFS= read -r dir; do
         local name; name=$(basename "$dir")
-        local short="${name#dria-node-0x}"
+        local name_lc; name_lc=$(echo "$name" | tr '[:upper:]' '[:lower:]')
         local running
-        running=$(docker ps --filter "name=dria-${short:0:8}-" --format "{{.Names}}" 2>/dev/null | wc -l)
+        running=$(docker ps --filter "name=${name_lc}" --format "{{.Names}}" 2>/dev/null | wc -l)
         local total_svc
         total_svc=$(docker compose -f "$dir/docker-compose.yml" config --services 2>/dev/null | wc -l)
         echo -e "  ${C}${name}${N}  ${G}${running}${N}/${total_svc} running"
@@ -355,9 +356,11 @@ cmd_wallets() {
     echo ""
     local count=0
     while IFS= read -r dir; do
-        local addr; addr=$(basename "$dir" | sed 's/^dria-node-//')
+        local folder; folder=$(basename "$dir")
+        local addr="${folder#dria-node-}"
+        local folder_lc; folder_lc=$(echo "$folder" | tr '[:upper:]' '[:lower:]')
         local running
-        running=$(docker ps --filter "name=dria-${addr:2:8}-" --format "{{.Names}}" 2>/dev/null | wc -l)
+        running=$(docker ps --filter "name=${folder_lc}" --format "{{.Names}}" 2>/dev/null | wc -l)
         echo "  • $addr  (${running} running)"
         (( count++ )) || true
     done < <(find_wallet_dirs)

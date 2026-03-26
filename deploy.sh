@@ -280,11 +280,12 @@ services:
 HDR
 
     # N identical services per wallet (parallel node instances)
+    # container_name intentionally omitted — Docker Compose auto-generates:
+    #   {folder_name}-node_{i}-1  e.g. dria-node-0x040dc19a...-node_1-1
     for i in $(seq 1 "$count"); do
         cat >> "$compose" << SVC
   node_${i}:
     image: "${DOCKER_IMAGE}"
-    container_name: dria-${short}-${i}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     env_file:
