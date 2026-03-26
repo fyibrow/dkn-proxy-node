@@ -331,6 +331,9 @@ start_all() {
         info "Starting node [$started/$total]: $name"
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
+        # Strip leftover container_name (folder-based naming needs it absent)
+        sed -i '/^[[:space:]]*container_name:/d' "$compose" 2>/dev/null || true
+
         if (cd "$dir" && docker compose up -d); then
             log "$name started"
         else
