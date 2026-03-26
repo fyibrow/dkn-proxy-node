@@ -146,14 +146,17 @@ impl InferenceEngine {
     /// from it on every call — enabling live key rotation without container restart.
     /// Falls back to the key that was set at startup.
     fn current_api_key(&self) -> String {
-        // Well-known mount path in Docker container
+        // Well-known mount path — set PROXY_ENV_FILE env var to override
         let env_file = std::env::var("PROXY_ENV_FILE")
             .unwrap_or_else(|_| "/etc/dria/proxy.env".to_string());
 
         if let Ok(content) = std::fs::read_to_string(&env_file) {
             for line in content.lines() {
-                if let Some(val) = line.strip_prefix("PROXY_API_KEY=") {
-                    let key = val.trim().trim_matches('"').trim_matches('\'');
+                // Support both PROXY_API_KEY= and VIKEY_API_KEY= (ollama-server-fake compat)
+                let val = line.strip_prefix("PROXY_API_KEY=")
+                    .or_else(|| line.strip_prefix("VIKEY_API_KEY="));
+                if let Some(v) = val {
+                    let key = v.trim().trim_matches('"').trim_matches('\'');
                     if !key.is_empty() {
                         return key.to_string();
                     }

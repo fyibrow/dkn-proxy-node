@@ -121,7 +121,7 @@ _migrate_compose() {
     environment:
       DRIA_WALLET: "0x${key}"
     volumes:
-      - ${nodes_dir_abs}/proxy.env:/etc/dria/proxy.env:ro
+      - ${nodes_dir_abs}/.env:/etc/dria/proxy.env:ro
     restart: "on-failure"
     networks:
       - dria-nodes
