@@ -46,6 +46,13 @@ _is_old_format() {
     grep -q "firstbatch/dkn-compute-node\|dkn-compute-node:latest" "$1" 2>/dev/null
 }
 
+# Strip hardcoded container_name lines from a compose file (in-place)
+_strip_container_name() {
+    local compose="$1"
+    grep -q "container_name:" "$compose" 2>/dev/null || return 0
+    sed -i '/^[[:space:]]*container_name:/d' "$compose"
+}
+
 # Derive Ethereum address from 64-char hex private key using Node.js/ethers
 _derive_address() {
     local key="$1"
@@ -170,6 +177,9 @@ cmd_start() {
             fi
         fi
 
+        # Strip any leftover container_name lines (old short-key format)
+        _strip_container_name "$compose"
+
         if (cd "$dir" && docker compose up -d --remove-orphans); then
             log "$name started"
         else
@@ -240,6 +250,9 @@ cmd_restart() {
             warn "Old format detected — auto-migrating..."
             _migrate_compose "$compose" || { warn "Migration failed — skipping $name"; continue; }
         fi
+
+        # Strip any leftover container_name lines
+        _strip_container_name "$compose"
 
         if (cd "$dir" && docker compose down && docker compose up -d); then
             log "$name restarted"
@@ -454,6 +467,30 @@ cmd_scale() {
     done < <(find_wallet_dirs)
 }
 
+# ── Fix container names (strip hardcoded container_name from all compose files)
+cmd_fix_names() {
+    local fixed=0
+    local clean=0
+
+    info "Scanning compose files for hardcoded container_name..."
+    while IFS= read -r compose; do
+        local name; name=$(basename "$(dirname "$compose")")
+        if grep -q "container_name:" "$compose" 2>/dev/null; then
+            _strip_container_name "$compose"
+            log "Fixed: $name"
+            (( fixed++ )) || true
+        else
+            (( clean++ )) || true
+        fi
+    done < <(find_composes)
+
+    echo ""
+    log "$fixed file(s) fixed, $clean already clean"
+    if [ "$fixed" -gt 0 ]; then
+        warn "Restart to apply new names: $(basename "$0") restart"
+    fi
+}
+
 # ── Migrate all old-format compose files ──────────────────────────────────────
 cmd_migrate() {
     local filter="${1:-}"
@@ -525,6 +562,7 @@ cat << 'EOF'
     update                    Pull latest source, rebuild image, restart
     rebuild                   Rebuild Docker image from local source and restart
     migrate [filter]          Convert old firstbatch/dkn-compute-node compose files to new format
+    fix-names                 Strip hardcoded container_name from compose files (use folder-based naming)
     prune                     Remove stopped Dria containers
 
   Examples:
@@ -558,6 +596,7 @@ main() {
     update)     cmd_update ;;
     rebuild)    cmd_rebuild ;;
     migrate)    cmd_migrate "${1:-}" ;;
+    fix-names)  cmd_fix_names ;;
     prune)      cmd_prune ;;
     scale)      cmd_scale "${1:-}" "${2:-}" ;;
     help|-h|--help) usage ;;
