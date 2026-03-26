@@ -30,23 +30,58 @@ find_wallet_dirs() {
     find "$NODES_DIR" -maxdepth 1 -type d -name "dria-node-0x*" 2>/dev/null | sort
 }
 
-# ── Start ─────────────────────────────────────────────────────────────────────
+# ── Start (sequential with delay) ─────────────────────────────────────────────
 cmd_start() {
     local filter="${1:-}"
-    local started=0
+    local delay="${START_DELAY:-180}"
 
-    while IFS= read -r compose; do
-        local dir; dir=$(dirname "$compose")
-        local name; name=$(basename "$dir")
+    # Collect matching compose files
+    local composes=()
+    while IFS= read -r f; do
+        local name; name=$(basename "$(dirname "$f")")
         [ -n "$filter" ] && [[ "$name" != *"$filter"* ]] && continue
-        info "Starting $name..."
-        (cd "$dir" && docker compose up -d --remove-orphans)
-        (( started++ )) || true
+        composes+=("$f")
     done < <(find_composes)
 
+    local total="${#composes[@]}"
+    if [ "$total" -eq 0 ]; then
+        warn "No wallet folders found. Run deploy.sh first."
+        return
+    fi
+
+    local started=0
+    for compose in "${composes[@]}"; do
+        local dir; dir=$(dirname "$compose")
+        local name; name=$(basename "$dir")
+        (( started++ )) || true
+
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        info "Starting node [$started/$total]: $name"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+        if (cd "$dir" && docker compose up -d --remove-orphans); then
+            log "$name started"
+        else
+            warn "Failed to start $name"
+        fi
+
+        if [ "$started" -lt "$total" ]; then
+            local next_time
+            next_time=$(date -d "+${delay} seconds" '+%H:%M:%S' 2>/dev/null \
+                     || date -v+${delay}S '+%H:%M:%S' 2>/dev/null \
+                     || echo "in ${delay}s")
+            echo ""
+            warn "Waiting ${delay}s before next node..."
+            info "Next node at: $next_time"
+            sleep "$delay"
+        fi
+    done
+
     echo ""
-    [ "$started" -eq 0 ] && warn "No wallet folders found. Run deploy.sh first." \
-                          || log "$started wallet folder(s) started"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log "All $total wallet folder(s) started"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     cmd_status
 }
@@ -64,17 +99,54 @@ cmd_stop() {
     log "Done"
 }
 
-# ── Restart ───────────────────────────────────────────────────────────────────
+# ── Restart (sequential with delay) ───────────────────────────────────────────
 cmd_restart() {
     local filter="${1:-}"
-    while IFS= read -r compose; do
+    local delay="${START_DELAY:-180}"
+
+    local composes=()
+    while IFS= read -r f; do
+        local name; name=$(basename "$(dirname "$f")")
+        [ -n "$filter" ] && [[ "$name" != *"$filter"* ]] && continue
+        composes+=("$f")
+    done < <(find_composes)
+
+    local total="${#composes[@]}"
+    [ "$total" -eq 0 ] && warn "No wallet folders found." && return
+
+    local current=0
+    for compose in "${composes[@]}"; do
         local dir; dir=$(dirname "$compose")
         local name; name=$(basename "$dir")
-        [ -n "$filter" ] && [[ "$name" != *"$filter"* ]] && continue
-        info "Restarting $name..."
-        (cd "$dir" && docker compose restart)
-    done < <(find_composes)
-    log "Done"
+        (( current++ )) || true
+
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        info "Restarting node [$current/$total]: $name"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+        if (cd "$dir" && docker compose down && docker compose up -d); then
+            log "$name restarted"
+        else
+            warn "Failed to restart $name"
+        fi
+
+        if [ "$current" -lt "$total" ]; then
+            local next_time
+            next_time=$(date -d "+${delay} seconds" '+%H:%M:%S' 2>/dev/null \
+                     || date -v+${delay}S '+%H:%M:%S' 2>/dev/null \
+                     || echo "in ${delay}s")
+            echo ""
+            warn "Waiting ${delay}s before next node..."
+            info "Next node at: $next_time"
+            sleep "$delay"
+        fi
+    done
+
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log "All $total wallet folder(s) restarted"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
 # ── Logs ──────────────────────────────────────────────────────────────────────

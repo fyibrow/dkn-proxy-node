@@ -160,11 +160,13 @@ load_env_file() {
     export DRIA_MAX_CONCURRENT="${DRIA_MAX_CONCURRENT:-4}"
     export PROXY_MODELS="${PROXY_MODELS:-}"
     export RUST_LOG="${RUST_LOG:-info}"
+    export START_DELAY="${START_DELAY:-180}"
 
     log "API: $PROXY_API_URL"
     log "Model: $PROXY_DEFAULT_MODEL"
     log "Dria models: $DRIA_MODELS"
     log "Nodes per wallet: $NODE_COUNT"
+    log "Start delay: ${START_DELAY}s between wallets"
 }
 
 # Write the translated proxy.env (with PROXY_* names) used by all containers
@@ -305,20 +307,51 @@ SVC
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# START ALL CONTAINERS
+# START ALL CONTAINERS  (sequential with delay between wallet folders)
 # ═══════════════════════════════════════════════════════════════════════════════
 start_all() {
     step "Starting all nodes"
+
+    local delay="${START_DELAY:-180}"
+    local composes=()
+    while IFS= read -r f; do composes+=("$f"); done \
+        < <(find "$NODES_DIR" -maxdepth 2 -name "docker-compose.yml" -type f | sort)
+
+    local total="${#composes[@]}"
     local started=0
 
-    while IFS= read -r compose; do
+    for compose in "${composes[@]}"; do
         local dir; dir=$(dirname "$compose")
-        info "Starting $(basename "$dir")..."
-        (cd "$dir" && docker compose up -d) && (( started++ )) || true
-    done < <(find "$NODES_DIR" -maxdepth 2 -name "docker-compose.yml" -type f | sort)
+        local name; name=$(basename "$dir")
+        (( started++ )) || true
+
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        info "Starting node [$started/$total]: $name"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+        if (cd "$dir" && docker compose up -d); then
+            log "$name started"
+        else
+            warn "Failed to start $name"
+        fi
+
+        if [ "$started" -lt "$total" ]; then
+            local next_time
+            next_time=$(date -d "+${delay} seconds" '+%H:%M:%S' 2>/dev/null \
+                     || date -v+${delay}S '+%H:%M:%S' 2>/dev/null \
+                     || echo "in ${delay}s")
+            echo ""
+            warn "Waiting ${delay}s before next node..."
+            info "Next node at: $next_time"
+            sleep "$delay"
+        fi
+    done
 
     echo ""
-    log "$started wallet folder(s) started"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log "All $total wallet folder(s) started"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
 
     docker ps --filter "name=dria-" \
