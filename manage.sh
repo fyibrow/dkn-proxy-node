@@ -416,7 +416,78 @@ cmd_update_key() {
         sed -i "s|^VIKEY_API_KEY=.*|VIKEY_API_KEY=${new_key}|; s|^PROXY_API_KEY=.*|PROXY_API_KEY=${new_key}|" \
             "$NODES_DIR/.env" && log "Updated $NODES_DIR/.env"
 
-    warn "Restart nodes to apply: $(basename "$0") restart"
+    echo ""
+    read -rp $'\033[0;36m[?]\033[0m Apply now? Quick restart all containers? [Y/n]: ' do_restart
+    if [[ "${do_restart:-Y}" =~ ^[Yy]$ ]]; then
+        cmd_quick_restart
+    else
+        warn "Apply later: $(basename "$0") quick-restart"
+    fi
+}
+
+# ── Quick restart (parallel, no delay) — for env updates ──────────────────────
+cmd_quick_restart() {
+    local filter="${1:-}"
+    info "Quick restart — parallel, no delay (for env/config updates)..."
+
+    local composes=()
+    while IFS= read -r f; do
+        local name; name=$(basename "$(dirname "$f")")
+        [ -n "$filter" ] && [[ "$name" != *"$filter"* ]] && continue
+        composes+=("$f")
+    done < <(find_composes)
+
+    [ "${#composes[@]}" -eq 0 ] && warn "No wallet folders found." && return
+
+    # Recreate all in parallel (picks up new env_file without delay)
+    local pids=()
+    for compose in "${composes[@]}"; do
+        local dir; dir=$(dirname "$compose")
+        _strip_container_name "$compose"
+        ( cd "$dir" && docker compose up -d --force-recreate 2>/dev/null ) &
+        pids+=($!)
+    done
+
+    # Wait for all background jobs
+    local ok=0 fail=0
+    for pid in "${pids[@]+"${pids[@]}"}"; do
+        if wait "$pid" 2>/dev/null; then (( ok++ )) || true
+        else (( fail++ )) || true; fi
+    done
+
+    echo ""
+    log "Quick restart done: ${ok} OK, ${fail} failed"
+    echo ""
+    docker ps --filter "name=dria-" \
+        --format "table {{.Names}}\t{{.Status}}\t{{.RunningFor}}"
+    echo ""
+}
+
+# ── Watch proxy.env and auto quick-restart on change ──────────────────────────
+cmd_watch_env() {
+    [ -f "$PROXY_ENV" ] || err "No proxy.env at $PROXY_ENV. Run deploy.sh first."
+
+    # Install inotify-tools if needed
+    if ! command -v inotifywait &>/dev/null; then
+        info "Installing inotify-tools..."
+        sudo apt-get install -y -qq inotify-tools \
+            || err "Cannot install inotify-tools. Install manually: apt-get install inotify-tools"
+    fi
+
+    info "Watching: $PROXY_ENV"
+    info "Nodes will auto quick-restart whenever proxy.env is saved."
+    info "Press Ctrl+C to stop."
+    echo ""
+
+    # Watch for write/close events; debounce 3s to avoid double-trigger
+    while inotifywait -e close_write,moved_to "$PROXY_ENV" 2>/dev/null; do
+        echo ""
+        warn "[$(date '+%H:%M:%S')] proxy.env changed — triggering quick restart..."
+        sleep 3  # debounce: wait in case of rapid sequential saves
+        cmd_quick_restart
+        echo ""
+        info "Watching again: $PROXY_ENV"
+    done
 }
 
 # ── Rebuild Docker image ───────────────────────────────────────────────────────
@@ -542,7 +613,8 @@ cat << 'EOF'
   Control:
     start  [filter]           Start all nodes (optional: filter by address)
     stop   [filter]           Stop all nodes
-    restart [filter]          Restart all nodes
+    restart [filter]          Restart all nodes sequentially (with delay)
+    quick-restart [filter]    Restart all nodes in PARALLEL, no delay (for env updates)
     status                    Show per-wallet container status
 
   Logs:
@@ -558,11 +630,12 @@ cat << 'EOF'
     config                    Show current proxy config (key masked)
 
   Maintenance:
-    update-key                Update VIKEY_API_KEY / PROXY_API_KEY in all configs
+    update-key                Update VIKEY_API_KEY / PROXY_API_KEY (prompts quick-restart)
+    watch-env                 Auto quick-restart when proxy.env changes (uses inotifywait)
     update                    Pull latest source, rebuild image, restart
     rebuild                   Rebuild Docker image from local source and restart
     migrate [filter]          Convert old firstbatch/dkn-compute-node compose files to new format
-    fix-names                 Strip hardcoded container_name from compose files (use folder-based naming)
+    fix-names                 Strip hardcoded container_name from compose files
     prune                     Remove stopped Dria containers
 
   Examples:
@@ -586,13 +659,15 @@ main() {
     case "$cmd" in
     start)      cmd_start "${1:-}" ;;
     stop)       cmd_stop "${1:-}" ;;
-    restart)    cmd_restart "${1:-}" ;;
-    logs)       cmd_logs "${1:-150}" "${2:-}" ;;
+    restart)        cmd_restart "${1:-}" ;;
+    quick-restart)  cmd_quick_restart "${1:-}" ;;
+    logs)           cmd_logs "${1:-150}" "${2:-}" ;;
     follow)     cmd_follow "${1:-}" ;;
     status)     cmd_status ;;
     wallets)    cmd_wallets ;;
     config)     cmd_config ;;
     update-key) cmd_update_key ;;
+    watch-env)  cmd_watch_env ;;
     update)     cmd_update ;;
     rebuild)    cmd_rebuild ;;
     migrate)    cmd_migrate "${1:-}" ;;
