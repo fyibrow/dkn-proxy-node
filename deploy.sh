@@ -235,10 +235,10 @@ derive_address() {
 
     if command -v node &>/dev/null && [ -d "$gen_dir/node_modules/ethers" ]; then
         node -e "
-const {Wallet}=require('ethers');
+const {Wallet}=require('$gen_dir/node_modules/ethers');
 try{process.stdout.write(new Wallet('0x$key').address);}
-catch(e){process.stdout.write('0x'+process.argv[1].slice(0,40));}
-" "$key" 2>/dev/null || echo "0x${key:0:40}"
+catch(e){process.stdout.write('0x'+'$key'.slice(0,40));}
+" 2>/dev/null || echo "0x${key:0:40}"
     else
         echo "0x${key:0:40}"
     fi
@@ -307,7 +307,7 @@ SVC
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# START ALL CONTAINERS  (sequential with delay between wallet folders)
+# START ALL CONTAINERS
 # ═══════════════════════════════════════════════════════════════════════════════
 start_all() {
     step "Starting all nodes"
@@ -353,7 +353,6 @@ start_all() {
     log "All $total wallet folder(s) started"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
-
     docker ps --filter "name=dria-" \
         --format "table {{.Names}}\t{{.Status}}\t{{.RunningFor}}"
     echo ""
