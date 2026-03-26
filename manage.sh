@@ -13,6 +13,15 @@ PROXY_ENV="$NODES_DIR/proxy.env"
 DOCKER_IMAGE="dria-proxy-node:latest"
 REPO_DIR="${REPO_DIR:-/root/dkn-proxy-node}"
 
+# Load START_DELAY (and other overrides) from .env if present
+# Done via grep to avoid side-effects of full source
+_load_env_var() {
+    local key="$1" file="$NODES_DIR/.env"
+    [ -f "$file" ] && grep -E "^${key}=" "$file" | cut -d= -f2- | tr -d "'\"\r " | head -1 || true
+}
+_val=$(_load_env_var START_DELAY)
+START_DELAY="${_val:-${START_DELAY:-180}}"
+
 # ── Colors ────────────────────────────────────────────────────────────────────
 G='\033[0;32m'; B='\033[0;34m'; Y='\033[1;33m'
 R='\033[0;31m'; C='\033[0;36m'; W='\033[1;37m'; N='\033[0m'
