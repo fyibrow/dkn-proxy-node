@@ -323,17 +323,26 @@ start_all() {
     local total="${#composes[@]}"
     local started=0
 
+    local skipped=0
     for compose in "${composes[@]}"; do
         local dir; dir=$(dirname "$compose")
         local name; name=$(basename "$dir")
         (( started++ )) || true
+
+        # Skip old-format compose files (firstbatch/dkn-compute-node)
+        # They should have been migrated by manage.sh migrate step above
+        if grep -q "firstbatch/dkn-compute-node\|dkn-compute-node:latest" "$compose" 2>/dev/null; then
+            warn "[$started/$total] Skipping old-format: $name (run manage.sh migrate)"
+            (( skipped++ )) || true
+            continue
+        fi
 
         echo ""
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         info "Starting node [$started/$total]: $name"
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-        # Strip leftover container_name (folder-based naming needs it absent)
+        # Strip leftover container_name lines
         sed -i '/^[[:space:]]*container_name:/d' "$compose" 2>/dev/null || true
 
         if (cd "$dir" && docker compose up -d); then
@@ -356,7 +365,8 @@ start_all() {
 
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    log "All $total wallet folder(s) started"
+    log "Started: $((total - skipped)) folder(s) — skipped (old format): $skipped"
+    [ "$skipped" -gt 0 ] && warn "Run: bash $REPO_DIR/manage.sh migrate  to convert skipped folders"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     docker ps --filter "name=dria-" \
@@ -504,7 +514,16 @@ main() {
         generate_compose "$key" "$addr"
     done
 
-    # ── 7. Start ───────────────────────────────────────────────────────────────
+    # ── 7. Migrate any remaining old-format compose files ─────────────────────
+    local old_count
+    old_count=$(find "$NODES_DIR" -maxdepth 2 -name "docker-compose.yml" \
+        -exec grep -l "firstbatch/dkn-compute-node" {} \; 2>/dev/null | wc -l)
+    if [ "$old_count" -gt 0 ]; then
+        step "Migrating $old_count old-format compose file(s)"
+        bash "$REPO_DIR/manage.sh" migrate 2>&1 || warn "Some migrations may have failed"
+    fi
+
+    # ── 8. Start ───────────────────────────────────────────────────────────────
     if $do_start; then
         start_all
     else
