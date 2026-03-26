@@ -109,6 +109,7 @@ _migrate_compose() {
 
     # container_name omitted — Docker Compose auto-generates from folder name:
     #   {folder}-node_{i}-1  e.g. dria-node-0x040dc19a...-node_1-1
+    local nodes_dir_abs; nodes_dir_abs=$(realpath "$NODES_DIR" 2>/dev/null || echo "$NODES_DIR")
     for i in $(seq 1 "$node_count"); do
         cat >> "$compose" << SVC
   node_${i}:
@@ -119,6 +120,8 @@ _migrate_compose() {
       - ../proxy.env
     environment:
       DRIA_WALLET: "0x${key}"
+    volumes:
+      - ${nodes_dir_abs}/proxy.env:/etc/dria/proxy.env:ro
     restart: "on-failure"
     networks:
       - dria-nodes

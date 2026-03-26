@@ -292,6 +292,8 @@ HDR
       - ../proxy.env
     environment:
       DRIA_WALLET: "0x${wallet_key}"
+    volumes:
+      - ${NODES_DIR}/proxy.env:/etc/dria/proxy.env:ro
     restart: "on-failure"
     networks:
       - ${NETWORK_NAME}

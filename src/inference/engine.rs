@@ -140,6 +140,29 @@ impl InferenceEngine {
         })
     }
 
+    /// Return the current API key.
+    ///
+    /// If `/etc/dria/proxy.env` is mounted (Docker volume), reads `PROXY_API_KEY`
+    /// from it on every call — enabling live key rotation without container restart.
+    /// Falls back to the key that was set at startup.
+    fn current_api_key(&self) -> String {
+        // Well-known mount path in Docker container
+        let env_file = std::env::var("PROXY_ENV_FILE")
+            .unwrap_or_else(|_| "/etc/dria/proxy.env".to_string());
+
+        if let Ok(content) = std::fs::read_to_string(&env_file) {
+            for line in content.lines() {
+                if let Some(val) = line.strip_prefix("PROXY_API_KEY=") {
+                    let key = val.trim().trim_matches('"').trim_matches('\'');
+                    if !key.is_empty() {
+                        return key.to_string();
+                    }
+                }
+            }
+        }
+        self.api_key.clone()
+    }
+
     pub fn has_multimodal(&self) -> bool {
         self.is_multimodal
     }
@@ -241,7 +264,7 @@ impl InferenceEngine {
         let response = self
             .client
             .post(&url)
-            .bearer_auth(&self.api_key)
+            .bearer_auth(self.current_api_key())
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
