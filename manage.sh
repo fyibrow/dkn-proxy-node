@@ -493,6 +493,70 @@ cmd_watch_env() {
     done
 }
 
+# ── Cleanup duplicate folders (wrong-address folders from failed derive_address) ──
+cmd_cleanup_dupes() {
+    echo ""
+    info "Scanning for duplicate DRIA_WALLET keys across folders..."
+
+    declare -A key_to_dir
+    local dupes=()
+
+    while IFS= read -r compose; do
+        local dir; dir=$(dirname "$compose")
+        local key
+        key=$(grep -oE 'DRIA_WALLET:[[:space:]]+"0x[a-fA-F0-9]+"' "$compose" 2>/dev/null \
+            | grep -oE '[a-fA-F0-9]{64}' | head -1)
+        [ -z "$key" ] && continue
+
+        if [ -n "${key_to_dir[$key]:-}" ]; then
+            # Duplicate found — determine which folder name matches key prefix (wrong one)
+            local key_prefix="${key:0:40}"
+            local existing_addr; existing_addr=$(basename "${key_to_dir[$key]}" | sed 's/dria-node-0x//i' | tr '[:upper:]' '[:lower:]')
+            local current_addr; current_addr=$(basename "$dir" | sed 's/dria-node-0x//i' | tr '[:upper:]' '[:lower:]')
+
+            if [ "${current_addr}" = "${key_prefix,,}" ]; then
+                dupes+=("$dir")
+            elif [ "${existing_addr}" = "${key_prefix,,}" ]; then
+                dupes+=("${key_to_dir[$key]}")
+                key_to_dir[$key]="$dir"  # replace with the correct one
+            else
+                # Can't determine — keep existing, warn about current
+                warn "Cannot auto-determine which is correct:"
+                warn "  A: ${key_to_dir[$key]}"
+                warn "  B: $dir"
+                warn "  Keeping A, skipping B"
+                dupes+=("$dir")
+            fi
+        else
+            key_to_dir[$key]="$dir"
+        fi
+    done < <(find_composes)
+
+    if [ "${#dupes[@]}" -eq 0 ]; then
+        log "No duplicate folders found."
+        return
+    fi
+
+    echo ""
+    warn "Found ${#dupes[@]} duplicate folder(s) to delete:"
+    for d in "${dupes[@]}"; do
+        echo "  - $d"
+    done
+    echo ""
+    read -rp $'\033[0;36m[?]\033[0m Delete these folders? [y/N]: ' confirm
+    [[ "${confirm:-N}" =~ ^[Yy]$ ]] || { warn "Aborted."; return; }
+
+    for d in "${dupes[@]}"; do
+        (cd "$d" && docker compose down 2>/dev/null) || true
+        rm -rf "$d"
+        log "Deleted: $d"
+    done
+
+    echo ""
+    log "Cleanup done. Remaining folders: $(find_wallet_dirs | wc -l)"
+    echo ""
+}
+
 # ── Rebuild Docker image ───────────────────────────────────────────────────────
 cmd_rebuild() {
     [ -d "$REPO_DIR" ] || err "Source not found at $REPO_DIR"
@@ -639,6 +703,7 @@ cat << 'EOF'
     rebuild                   Rebuild Docker image from local source and restart
     migrate [filter]          Convert old firstbatch/dkn-compute-node compose files to new format
     fix-names                 Strip hardcoded container_name from compose files
+    cleanup-dupes             Delete duplicate wallet folders (wrong-address folders from failed deploy)
     prune                     Remove stopped Dria containers
 
   Examples:
@@ -674,7 +739,8 @@ main() {
     update)     cmd_update ;;
     rebuild)    cmd_rebuild ;;
     migrate)    cmd_migrate "${1:-}" ;;
-    fix-names)  cmd_fix_names ;;
+    fix-names)      cmd_fix_names ;;
+    cleanup-dupes)  cmd_cleanup_dupes ;;
     prune)      cmd_prune ;;
     scale)      cmd_scale "${1:-}" "${2:-}" ;;
     help|-h|--help) usage ;;

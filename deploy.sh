@@ -260,9 +260,21 @@ generate_compose() {
     local wallet_key="$1"  # 64 hex chars, no 0x
     local wallet_addr="$2" # 0xFULLADDRESS
     local count="${NODE_COUNT:-1}"
-    local short="${wallet_addr:2:8}"  # 8 chars after 0x
 
+    # If any existing folder already has this key, reuse it instead of creating
+    # a new folder (prevents duplicate folders when derive_address() falls back)
     local wallet_dir="$NODES_DIR/dria-node-${wallet_addr}"
+    local existing
+    existing=$(find "$NODES_DIR" -maxdepth 2 -name "docker-compose.yml" -type f 2>/dev/null \
+        | xargs grep -l "DRIA_WALLET.*${wallet_key}" 2>/dev/null | head -1)
+    if [ -n "$existing" ]; then
+        local existing_dir; existing_dir=$(dirname "$existing")
+        if [ "$existing_dir" != "$wallet_dir" ]; then
+            info "Key already exists in: $(basename "$existing_dir") — updating in place"
+            wallet_dir="$existing_dir"
+        fi
+    fi
+
     mkdir -p "$wallet_dir"
 
     local compose="$wallet_dir/docker-compose.yml"
