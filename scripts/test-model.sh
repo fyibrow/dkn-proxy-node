@@ -156,25 +156,25 @@ send_request() {
         return 1
     fi
 
-    # Check API error in body
-    if grep -qE '"error"|"detail"' "$TMPFILE" 2>/dev/null && ! grep -q '"delta"' "$TMPFILE"; then
-        local msg; msg=$(grep -oE '"message":"[^"]*"' "$TMPFILE" | head -1 | cut -d: -f2- | tr -d '"')
-        [ -z "$msg" ] && msg=$(cat "$TMPFILE" | head -c 200)
-        fail "$label — API error: $msg"
-        (( FAIL++ )) || true
-        return 1
+    # Check API error in body (only if no SSE chunks present)
+    if ! grep -q "^data:" "$TMPFILE" 2>/dev/null; then
+        if grep -qE '"error"|"detail"' "$TMPFILE" 2>/dev/null; then
+            local msg; msg=$(grep -oE '"message":"[^"]*"' "$TMPFILE" | head -1 | cut -d: -f2- | tr -d '"')
+            [ -z "$msg" ] && msg=$(head -c 200 "$TMPFILE")
+            fail "$label — API error: $msg"
+            (( FAIL++ )) || true
+            return 1
+        fi
     fi
 
-    # Parse: normalize CRLF → LF, then extract from SSE or plain JSON
+    # Parse: pipe file directly to Python — avoids bash variable newline mangling
     local text=""
-    local raw; raw=$(tr -d '\r' < "$TMPFILE")
-
-    if echo "$raw" | grep -q "^data:"; then
-        # SSE streaming: pipe raw data to pre-written parser file
-        text=$(echo "$raw" | python3 "$PY_PARSER")
+    if grep -q "^data:" "$TMPFILE" 2>/dev/null; then
+        # SSE streaming: pipe raw file directly to parser (no bash variable)
+        text=$(tr -d '\r' < "$TMPFILE" | python3 "$PY_PARSER")
     else
         # Non-streaming plain JSON
-        text=$(echo "$raw" | python3 -c "
+        text=$(tr -d '\r' < "$TMPFILE" | python3 -c "
 import sys,json
 try:
     d=json.loads(sys.stdin.read())
