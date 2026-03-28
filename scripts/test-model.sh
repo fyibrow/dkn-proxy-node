@@ -73,23 +73,56 @@ PY_PARSER=$(mktemp /tmp/dria-py-XXXXXX.py)
 trap 'rm -f "$TMPFILE" "$PY_PARSER"' EXIT
 
 # Write SSE parser to temp file (avoids heredoc-inside-$() conflict)
+# Handles multi-line JSON chunks where literal \n in content breaks lines
 cat > "$PY_PARSER" << 'PYEOF'
 import sys, json
+
 out = ''
-for line in sys.stdin:
-    line = line.rstrip('\n\r')
-    if not line.startswith('data:'):
-        continue
-    payload = line[5:].lstrip(' ')
-    if payload == '[DONE]':
-        break
+current = ''
+
+for raw_line in sys.stdin:
+    line = raw_line.rstrip('\n\r')
+
+    if line.startswith('data:'):
+        # Process accumulated previous payload
+        if current:
+            try:
+                d = json.loads(current)
+                content = (d.get('choices') or [{}])[0].get('delta', {}).get('content')
+                if content:
+                    out += content
+            except Exception:
+                pass
+        payload = line[5:].lstrip(' ')
+        if payload == '[DONE]':
+            current = ''
+            break
+        current = payload
+    elif line == '':
+        # Blank line = SSE event boundary; process current if any
+        if current:
+            try:
+                d = json.loads(current)
+                content = (d.get('choices') or [{}])[0].get('delta', {}).get('content')
+                if content:
+                    out += content
+            except Exception:
+                pass
+            current = ''
+    else:
+        # Continuation of previous data line (literal newline inside JSON)
+        current += '\n' + line
+
+# Process any remaining payload
+if current:
     try:
-        d = json.loads(payload)
+        d = json.loads(current)
         content = (d.get('choices') or [{}])[0].get('delta', {}).get('content')
         if content:
             out += content
     except Exception:
         pass
+
 sys.stdout.write(out)
 PYEOF
 
