@@ -69,7 +69,29 @@ echo ""
 
 PASS=0; FAIL=0
 TMPFILE=$(mktemp /tmp/dria-test-XXXXXX)
-trap 'rm -f "$TMPFILE"' EXIT
+PY_PARSER=$(mktemp /tmp/dria-py-XXXXXX.py)
+trap 'rm -f "$TMPFILE" "$PY_PARSER"' EXIT
+
+# Write SSE parser to temp file (avoids heredoc-inside-$() conflict)
+cat > "$PY_PARSER" << 'PYEOF'
+import sys, json
+out = ''
+for line in sys.stdin:
+    line = line.rstrip('\n\r')
+    if not line.startswith('data:'):
+        continue
+    payload = line[5:].lstrip(' ')
+    if payload == '[DONE]':
+        break
+    try:
+        d = json.loads(payload)
+        content = (d.get('choices') or [{}])[0].get('delta', {}).get('content')
+        if content:
+            out += content
+    except Exception:
+        pass
+sys.stdout.write(out)
+PYEOF
 
 # ── Helper: send streaming request, collect full text ─────────────────────────
 send_request() {
@@ -115,39 +137,16 @@ send_request() {
     local raw; raw=$(tr -d '\r' < "$TMPFILE")
 
     if echo "$raw" | grep -q "^data:"; then
-        # SSE streaming: write each data line to python via temp pipe
-        text=$(echo "$raw" | python3 - << 'PYEOF'
-import sys, json
-
-out = ''
-chunk_count = 0
-for line in sys.stdin:
-    line = line.rstrip('\n')
-    if not line.startswith('data:'):
-        continue
-    payload = line[5:].lstrip(' ')
-    if payload == '[DONE]':
-        break
-    try:
-        d = json.loads(payload)
-        content = (d.get('choices') or [{}])[0].get('delta', {}).get('content')
-        if content:
-            out += content
-            chunk_count += 1
-    except Exception:
-        pass
-
-sys.stdout.write(out)
-PYEOF
-)
+        # SSE streaming: pipe raw data to pre-written parser file
+        text=$(echo "$raw" | python3 "$PY_PARSER")
     else
         # Non-streaming plain JSON
         text=$(echo "$raw" | python3 -c "
-import sys, json
+import sys,json
 try:
-    d = json.loads(sys.stdin.read())
+    d=json.loads(sys.stdin.read())
     sys.stdout.write(d['choices'][0]['message']['content'] or '')
-except Exception as e:
+except:
     sys.stdout.write('')
 ")
     fi
