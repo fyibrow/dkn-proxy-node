@@ -68,81 +68,111 @@ info "Key       : ${API_KEY:0:8}***"
 echo ""
 
 PASS=0; FAIL=0
+TMPFILE=$(mktemp /tmp/dria-test-XXXXXX)
+trap 'rm -f "$TMPFILE"' EXIT
 
 # ── Helper: send streaming request, collect full text ─────────────────────────
 send_request() {
     local label="$1"
     local payload="$2"
+    local allow_empty="${3:-false}"   # true = pass even if content is empty
     local t0; t0=$(date +%s%3N)
 
-    local response
-    response=$(curl -s -X POST "$ENDPOINT" \
+    # Write response to temp file to avoid bash variable newline mangling
+    local http_code
+    http_code=$(curl -s -X POST "$ENDPOINT" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $API_KEY" \
         --max-time 60 \
+        -o "$TMPFILE" \
+        -w "%{http_code}" \
         -d "$payload") || { fail "$label — curl failed (timeout or network error)"; (( FAIL++ )) || true; return 1; }
 
     local t1; t1=$(date +%s%3N)
     local elapsed=$(( t1 - t0 ))
 
-    # Check HTTP error embedded in JSON
-    if echo "$response" | grep -qE '"error"|"code":[45][0-9][0-9]'; then
-        local msg; msg=$(echo "$response" | grep -oE '"message":"[^"]*"' | head -1 | cut -d: -f2- | tr -d '"')
-        fail "$label — API error: $msg"
-        echo "  Response: $response" | head -c 300
+    # Check HTTP status
+    if [ "$http_code" != "200" ]; then
+        local msg; msg=$(cat "$TMPFILE" | grep -oE '"message":"[^"]*"' | head -1 | cut -d: -f2- | tr -d '"')
+        fail "$label — HTTP $http_code: $msg"
+        echo "  Body: $(head -c 300 "$TMPFILE")"
         echo ""
         (( FAIL++ )) || true
         return 1
     fi
 
-    # Extract generated text from SSE stream or plain JSON
+    # Check API error in body
+    if grep -qE '"error"|"detail"' "$TMPFILE" 2>/dev/null && ! grep -q '"delta"' "$TMPFILE"; then
+        local msg; msg=$(grep -oE '"message":"[^"]*"' "$TMPFILE" | head -1 | cut -d: -f2- | tr -d '"')
+        [ -z "$msg" ] && msg=$(cat "$TMPFILE" | head -c 200)
+        fail "$label — API error: $msg"
+        (( FAIL++ )) || true
+        return 1
+    fi
+
+    # Parse: normalize CRLF → LF, then extract from SSE or plain JSON
     local text=""
-    if echo "$response" | grep -q "^data:"; then
-        # SSE streaming format
-        text=$(echo "$response" | grep "^data:" | grep -v "\[DONE\]" \
-            | sed 's/^data: //' \
-            | python3 -c "
+    local raw; raw=$(tr -d '\r' < "$TMPFILE")
+
+    if echo "$raw" | grep -q "^data:"; then
+        # SSE streaming: write each data line to python via temp pipe
+        text=$(echo "$raw" | python3 - << 'PYEOF'
 import sys, json
+
 out = ''
+chunk_count = 0
 for line in sys.stdin:
-    line = line.strip()
-    if not line: continue
+    line = line.rstrip('\n')
+    if not line.startswith('data:'):
+        continue
+    payload = line[5:].lstrip(' ')
+    if payload == '[DONE]':
+        break
     try:
-        d = json.loads(line)
-        c = d.get('choices', [{}])[0].get('delta', {}).get('content') or ''
-        out += c
-    except: pass
-print(out, end='')
-" 2>/dev/null)
+        d = json.loads(payload)
+        content = (d.get('choices') or [{}])[0].get('delta', {}).get('content')
+        if content:
+            out += content
+            chunk_count += 1
+    except Exception:
+        pass
+
+sys.stdout.write(out)
+PYEOF
+)
     else
-        # Non-streaming JSON
-        text=$(echo "$response" | python3 -c "
+        # Non-streaming plain JSON
+        text=$(echo "$raw" | python3 -c "
 import sys, json
 try:
     d = json.loads(sys.stdin.read())
-    print(d['choices'][0]['message']['content'], end='')
+    sys.stdout.write(d['choices'][0]['message']['content'] or '')
 except Exception as e:
-    print(f'parse_error:{e}', end='')
-" 2>/dev/null)
+    sys.stdout.write('')
+")
     fi
 
-    # Prompt tokens (if available)
-    local prompt_tok; prompt_tok=$(echo "$response" \
-        | grep -oE '"prompt_tokens":[0-9]+' | grep -oE '[0-9]+' | head -1)
-    local comp_tok; comp_tok=$(echo "$response" \
-        | grep -oE '"completion_tokens":[0-9]+' | grep -oE '[0-9]+' | head -1)
+    # Prompt tokens (if available in body)
+    local prompt_tok; prompt_tok=$(grep -oE '"prompt_tokens":[0-9]+' "$TMPFILE" | grep -oE '[0-9]+' | head -1)
+    local comp_tok; comp_tok=$(grep -oE '"completion_tokens":[0-9]+' "$TMPFILE" | grep -oE '[0-9]+' | head -1)
 
     local word_count; word_count=$(echo "$text" | wc -w)
 
-    if [ -z "$text" ] || [ "$text" = "null" ]; then
-        fail "$label (${elapsed}ms) — empty response"
-        echo "  Raw: $(echo "$response" | head -c 400)"
+    # Empty content is OK if allow_empty=true (e.g. max_tokens=1 may return whitespace)
+    if [ -z "${text// }" ] && [ "$allow_empty" != "true" ]; then
+        fail "$label (${elapsed}ms) — empty content in response"
+        echo "  Raw (first 400 chars): $(head -c 400 "$TMPFILE")"
+        echo ""
         (( FAIL++ )) || true
         return 1
     fi
 
     ok "$label (${elapsed}ms | prompt:${prompt_tok:-?}tok comp:${comp_tok:-?}tok words:${word_count})"
-    echo "  Preview: $(echo "$text" | head -c 120)..."
+    if [ -n "${text// }" ]; then
+        echo "  Preview: $(echo "$text" | head -c 150 | tr '\n' ' ')..."
+    else
+        echo "  Preview: [whitespace/newline token — expected for max_tokens=1]"
+    fi
     (( PASS++ )) || true
 }
 
@@ -242,7 +272,7 @@ send_request "max_tokens=1" "$(cat <<EOF
   "max_tokens": 1
 }
 EOF
-)"
+)" "true"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
